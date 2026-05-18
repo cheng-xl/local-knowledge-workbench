@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+*.test
+*.spec
+
+# Environment
+.env
+
+# Chroma data
+data/chroma/*.parquet
+data/chroma/*.bin
+
+# Streamlit
+.streamlit/
+
+# Node
+node_modules/
+package-lock.json
+
+# Temporary files
+*.tmp
+*.temp
+
+# Unrelated artifacts
+.claude/
+README_PYTHON.md
+create_application.js
+package.json
