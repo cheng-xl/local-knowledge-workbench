@@ -1,5 +1,6 @@
-from typing import TypedDict, List, Annotated, Literal, Optional
+import re
 import operator
+from typing import TypedDict, List, Annotated, Optional
 from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -29,10 +30,8 @@ _llm: Optional[OpenAI] = None
 def get_llm() -> OpenAI:
     global _llm
     if _llm is None:
-        _llm = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-        )
+        _llm = OpenAI(api_key=settings.openai_api_key,
+                      base_url=settings.openai_base_url)
     return _llm
 
 
@@ -56,12 +55,38 @@ def _tool_results(messages: list) -> list:
     return [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
 
 
+def _node_context(state: AgentState) -> dict:
+    """Extract commonly used values from state for downstream nodes."""
+    msgs = state["messages"]
+    return {
+        "msgs": msgs,
+        "last_user": _last_user_msg(msgs),
+        "docs": state.get("retrieved_docs", []),
+        "tool_msgs": _tool_results(msgs),
+        "loop_count": state.get("loop_count", 0),
+    }
+
+
 # ── Tool registry ──────────────────────────────────────────
 
 from tools.calculator import calculator
 from tools.datetime_tool import datetime_tool
 
 LOCAL_TOOLS = {"calculator": calculator, "datetime_tool": datetime_tool}
+
+# Keyword-based tool routing (avoids extra LLM call)
+TOOL_KEYWORDS = {
+    "calculator": ["计算", "算", "+", "-", "*", "/", "×", "÷", "平方", "开方", "等于"],
+    "datetime_tool": ["时间", "日期", "今天", "现在", "星期", "几点", "几月", "几号"],
+}
+
+
+def _pick_tool(query: str) -> Optional[str]:
+    """Pick tool by keyword matching. Returns tool name or None."""
+    for name, keywords in TOOL_KEYWORDS.items():
+        if any(kw in query for kw in keywords):
+            return name
+    return None
 
 
 # ── Nodes ──────────────────────────────────────────────────
@@ -81,29 +106,25 @@ def retrieve_node(state: AgentState) -> dict:
 
 
 def decide_node(state: AgentState) -> dict:
-    msgs = state["messages"]
-    last_user = _last_user_msg(msgs)
-    query = last_user.get("content", "") if last_user else ""
-    docs = state.get("retrieved_docs", [])
-    loop_count = state.get("loop_count", 0)
-    tool_msgs = _tool_results(msgs)
+    ctx = _node_context(state)
+    query = ctx["last_user"].get("content", "") if ctx["last_user"] else ""
 
     doc_summary = "\n".join(
         f"[{i+1}] {d.metadata.get('source_file', '?')}: {d.page_content[:200]}..."
-        for i, d in enumerate(docs[:5])
+        for i, d in enumerate(ctx["docs"][:5])
     )
 
     prompt = f"""You are an AI assistant deciding the next action.
 
 User query: {query}
 
-Retrieved documents ({len(docs)} total):
+Retrieved documents ({len(ctx['docs'])} total):
 {doc_summary or '(none)'}
 
-Tool results so far ({len(tool_msgs)}):
-{[m.get('content', '')[:300] for m in tool_msgs[-3:]] or '(none)'}
+Tool results so far ({len(ctx['tool_msgs'])}):
+{[m.get('content', '')[:300] for m in ctx['tool_msgs'][-3:]] or '(none)'}
 
-Loop count: {loop_count}/{MAX_LOOPS}
+Loop count: {ctx['loop_count']}/{MAX_LOOPS}
 
 Decide the next step. Reply with EXACTLY ONE WORD:
 - tool: need to call a tool (calculator, datetime_tool)
@@ -119,7 +140,7 @@ Decide the next step. Reply with EXACTLY ONE WORD:
         logger.warning(f"LLM returned invalid decision '{decision}', defaulting to answer")
         decision = "answer"
 
-    logger.info(f"Decide: {decision} (loop {loop_count}/{MAX_LOOPS})")
+    logger.info(f"Decide: {decision} (loop {ctx['loop_count']}/{MAX_LOOPS})")
     return {"decision": decision}
 
 
@@ -127,55 +148,38 @@ def execute_node(state: AgentState) -> dict:
     if state.get("decision") != "tool":
         return {}
 
-    msgs = state["messages"]
-    last_user = _last_user_msg(msgs)
+    ctx = _node_context(state)
+    query = ctx["last_user"].get("content", "") if ctx["last_user"] else ""
 
-    prompt = f"""You have access to these tools: {', '.join(LOCAL_TOOLS.keys())}
-User request: {last_user.get('content', '') if last_user else 'No query'}
+    # Keyword-based tool selection (avoid LLM call for simple cases)
+    tool_name = _pick_tool(query)
+    if tool_name is None:
+        tool_name = "calculator"  # default fallback
 
-If the user wants a calculation, respond with: calculator("expression")
-If the user wants date/time, respond with: datetime_tool("action")
-Otherwise respond: none
+    tool_fn = LOCAL_TOOLS.get(tool_name)
+    if tool_fn is None:
+        return {"messages": [{"role": "tool", "content": f"Unknown tool: {tool_name}",
+                              "tool_call_id": "call_unknown", "name": "unknown"}]}
 
-Respond with ONLY the tool call in the exact format above, nothing else."""
+    # Extract argument: for calculator, find math expression; for datetime, find action
+    if tool_name == "calculator":
+        # Extract whatever comes after "计算" or just take the full query
+        arg = query
+        for sep in ["计算", "算一下", "算"]:
+            if sep in query:
+                arg = query.split(sep, 1)[-1].strip()
+                break
+    else:
+        arg = "now"  # datetime_tool default
 
-    response = _call_llm(prompt)
-    text = response.strip()
-    logger.info(f"Execute LLM response: {text[:100]}")
+    try:
+        result = tool_fn(arg)
+        logger.info(f"Tool {tool_name}({arg}) -> {str(result)[:80]}")
+    except Exception as e:
+        result = f"Error: {e}"
 
-    result_msg = None
-    for name in LOCAL_TOOLS:
-        if name in text:
-            try:
-                import re
-                match = re.search(rf'{name}\(\s*"([^"]*)"\s*\)', text)
-                arg = match.group(1) if match else ""
-                tool_fn = LOCAL_TOOLS[name]
-                result = tool_fn(arg)
-                result_msg = {
-                    "role": "tool",
-                    "content": str(result),
-                    "tool_call_id": f"call_{name}",
-                    "name": name,
-                }
-                logger.info(f"Tool {name}({arg}) -> {str(result)[:80]}")
-            except Exception as e:
-                result_msg = {
-                    "role": "tool",
-                    "content": f"Error calling {name}: {e}",
-                    "tool_call_id": f"call_{name}",
-                    "name": name,
-                }
-            break
-
-    if result_msg is None:
-        result_msg = {
-            "role": "tool",
-            "content": text,
-            "tool_call_id": "call_unknown",
-            "name": "unknown",
-        }
-
+    result_msg = {"role": "tool", "content": str(result),
+                  "tool_call_id": f"call_{tool_name}", "name": tool_name}
     return {"messages": [result_msg], "tool_calls": []}
 
 
@@ -186,16 +190,13 @@ def reflect_node(state: AgentState) -> dict:
         logger.warning(f"Max loops ({MAX_LOOPS}) reached, forcing end")
         return {"loop_count": loop_count, "decision": "end"}
 
-    msgs = state["messages"]
-    docs = state.get("retrieved_docs", [])
-    last_user = _last_user_msg(msgs)
-    tool_msgs = _tool_results(msgs)
+    ctx = _node_context(state)
 
     prompt = f"""Evaluate whether we have enough information to answer the user's question.
 
-User query: {last_user.get('content', '') if last_user else 'N/A'}
-Documents retrieved: {len(docs)}
-Tool results: {len(tool_msgs)}
+User query: {ctx['last_user'].get('content', '') if ctx['last_user'] else 'N/A'}
+Documents retrieved: {len(ctx['docs'])}
+Tool results: {len(ctx['tool_msgs'])}
 Loop: {loop_count}/{MAX_LOOPS}
 
 Reply with EXACTLY ONE WORD:
@@ -218,22 +219,19 @@ def human_node(state: AgentState) -> dict:
 
 
 def answer_node(state: AgentState) -> dict:
-    msgs = state["messages"]
-    docs = state.get("retrieved_docs", [])
-    last_user = _last_user_msg(msgs)
-    tool_msgs = _tool_results(msgs)
+    ctx = _node_context(state)
 
     context = "\n\n".join(
         f"[Doc {i+1} from {d.metadata.get('source_file', '?')}]\n{d.page_content}"
-        for i, d in enumerate(docs[:5])
+        for i, d in enumerate(ctx["docs"][:5])
     )
 
     tools_text = "\n".join(
         f"[{m.get('name', '?')}] {m.get('content', '')}"
-        for m in tool_msgs
+        for m in ctx["tool_msgs"]
     )
 
-    user_query = last_user.get("content", "") if last_user else "(no query)"
+    user_query = ctx["last_user"].get("content", "") if ctx["last_user"] else "(no query)"
 
     answer_prompt = f"""You are a helpful AI assistant. Answer the user's question based on the provided context.
 
@@ -278,23 +276,15 @@ def build_graph() -> StateGraph:
     graph.add_node("answer", answer_node)
 
     graph.set_entry_point("retrieve")
-
     graph.add_edge("retrieve", "decide")
-
     graph.add_conditional_edges("decide", route_after_decide, {
-        "tool": "execute",
-        "answer": "answer",
-        "human_confirm": "human_confirm",
-        "retrieve_again": "retrieve",
+        "tool": "execute", "answer": "answer",
+        "human_confirm": "human_confirm", "retrieve_again": "retrieve",
     })
-
     graph.add_edge("execute", "reflect")
-
     graph.add_conditional_edges("reflect", should_continue, {
-        "continue": "decide",
-        "end": "answer",
+        "continue": "decide", "end": "answer",
     })
-
     graph.add_edge("human_confirm", "execute")
     graph.add_edge("answer", END)
 

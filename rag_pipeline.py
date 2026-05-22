@@ -59,6 +59,22 @@ class RecursiveCharacterTextSplitter:
         self.chunk_overlap = chunk_overlap
         self.separators = separators or ["\n\n", "\n", "。", ".", " ", ""]
 
+    def _split_by_sep(self, text: str, sep: str) -> List[str]:
+        """Split text by a separator, merging pieces up to chunk_size."""
+        chunks = []
+        current = ""
+        for part in text.split(sep):
+            candidate = (current + sep + part).strip() if current else part
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = part
+        if current:
+            chunks.append(current)
+        return chunks
+
     def split_text(self, text: str) -> List[str]:
         if len(text) <= self.chunk_size:
             return [text]
@@ -72,8 +88,7 @@ class RecursiveCharacterTextSplitter:
                 if current:
                     chunks.append(current)
                 if len(para) > self.chunk_size:
-                    for sub in self._split_long(para):
-                        chunks.append(sub)
+                    chunks.extend(self._split_long(para))
                     current = ""
                 else:
                     current = para
@@ -84,20 +99,7 @@ class RecursiveCharacterTextSplitter:
     def _split_long(self, text: str) -> List[str]:
         for sep in self.separators[1:]:
             if sep and sep in text:
-                parts = text.split(sep)
-                chunks = []
-                current = ""
-                for part in parts:
-                    candidate = (current + sep + part).strip() if current else part
-                    if len(candidate) <= self.chunk_size:
-                        current = candidate
-                    else:
-                        if current:
-                            chunks.append(current)
-                        current = part
-                if current:
-                    chunks.append(current)
-                return chunks
+                return self._split_by_sep(text, sep)
         step = self.chunk_size - self.chunk_overlap
         return [text[i:i + self.chunk_size] for i in range(0, len(text), step)]
 
@@ -185,7 +187,7 @@ class RAGPipeline:
             bm25_results = [
                 Document(page_content=self._doc_texts[i],
                          metadata={"bm25_score": float(scores[i]),
-                                   "source_file": "bm25"})
+                                   "retrieval_method": "bm25"})
                 for i in top_idx if scores[i] > 0
             ]
             logger.debug(f"BM25 returned {len(bm25_results)} results")
@@ -226,8 +228,9 @@ class RAGPipeline:
             logger.warning("FlagEmbedding not installed, skipping rerank")
             return docs
 
-    def ingest_file(self, file_path: str) -> int:
+    def ingest_file(self, file_path: str,
+                    chunk_size: int = None, overlap: int = None) -> int:
         docs = self.load_document(file_path)
-        chunks = self.chunk_documents(docs)
+        chunks = self.chunk_documents(docs, chunk_size=chunk_size, overlap=overlap)
         self.add_to_store(chunks)
         return len(chunks)

@@ -26,7 +26,6 @@ class VectorStoreManager:
             path=self.persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        # 保持 "langchain" 名称以兼容现有数据
         self._collection = self._client.get_or_create_collection(name="langchain")
         logger.info(f"Chroma initialized at {self.persist_dir}")
 
@@ -38,9 +37,9 @@ class VectorStoreManager:
         embeddings = self._encode(texts)
         ids = [f"doc_{hash(d.page_content) % (10**10)}_{i}"
                for i, d in enumerate(documents)]
-        metadatas = [d.metadata for d in documents]
         self._collection.add(
-            ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+            ids=ids, embeddings=embeddings, documents=texts,
+            metadatas=[d.metadata for d in documents])
         logger.info(f"Added {len(documents)} documents to Chroma")
         return ids
 
@@ -52,25 +51,39 @@ class VectorStoreManager:
             n_results=top_k,
             where=filter if filter else None,
         )
-        docs = []
         ids = results.get("ids", [[]])[0]
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [None])[0] or [{}] * len(ids)
-        distances = results.get("distances", [[]])[0] or [0.0] * len(ids)
-        for i in range(len(ids)):
-            meta = metadatas[i] if i < len(metadatas) else {}
-            doc = Document(page_content=documents[i], metadata=dict(meta))
-            doc.metadata["score"] = 1.0 / (1.0 + distances[i])
+        docs_raw = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [None])[0] or [{}]
+        dists = results.get("distances", [[]])[0] or [0.0]
+        docs = []
+        for i, text in enumerate(docs_raw):
+            meta = dict(metas[i]) if i < len(metas) else {}
+            dist = dists[i] if i < len(dists) else 0.0
+            doc = Document(page_content=text, metadata=meta)
+            doc.metadata["score"] = 1.0 / (1.0 + dist)
             docs.append(doc)
         return docs
 
-    def search_with_score(self, query: str, top_k: int = 5,
-                          filter: Optional[dict] = None) -> List[tuple]:
-        docs = self.search(query, top_k=top_k, filter=filter)
-        return [(d, d.metadata.get("score", 0.0)) for d in docs]
+    # ── Knowledge base management ─────────────────────────
 
-    def delete_by_filter(self, filter: dict) -> None:
-        results = self._collection.get(where=filter)
-        if results.get("ids"):
-            self._collection.delete(ids=results["ids"])
-            logger.info(f"Deleted {len(results['ids'])} documents matching {filter}")
+    def get_stats(self) -> dict:
+        total = self._collection.count()
+        if total == 0:
+            return {"total": 0, "sources": []}
+        batch = self._collection.get(
+            limit=min(total, 5000), include=["metadatas"])
+        sources: dict[str, int] = {}
+        for m in batch.get("metadatas", []):
+            key = m.get("source_file", "unknown")
+            sources[key] = sources.get(key, 0) + 1
+        return {"total": total, "sources": sorted(
+            sources.items(), key=lambda x: x[1], reverse=True)}
+
+    def delete_by_source(self, source_file: str) -> int:
+        results = self._collection.get(
+            where={"source_file": source_file}, include=[])
+        ids = results.get("ids", [])
+        if ids:
+            self._collection.delete(ids=ids)
+            logger.info(f"Deleted {len(ids)} chunks from '{source_file}'")
+        return len(ids)

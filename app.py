@@ -126,7 +126,7 @@ with tab_docs:
             with status:
                 st.write(f"解析中：{f.name}")
                 try:
-                    n = rag.ingest_file(tmp)
+                    n = rag.ingest_file(tmp, chunk_size=chunk_size, overlap=overlap)
                     total += n
                     st.write(f"  → 生成 {n} 个文本块")
                 except Exception as e:
@@ -141,14 +141,48 @@ with tab_docs:
         st.toast(f"已索引 {total} 个文本块", icon=":material/check:")
         st.rerun()
 
-    if st.session_state.docs_indexed > 0:
-        st.success(f"知识库中现有 {st.session_state.docs_indexed} 个文本块")
-        if st.button("重建 BM25 索引"):
-            if st.session_state.rag:
-                st.session_state.rag._bm25 = None
-                _ = st.session_state.rag.bm25
-                st.toast("BM25 索引已重建", icon=":material/check:")
-                st.rerun()
+    # ── 知识库管理 ──────────────────────────────────────
+    st.divider()
+    st.markdown("### 知识库管理")
+
+    from vector_store import VectorStoreManager
+    vs = VectorStoreManager()
+    stats = vs.get_stats()
+
+    if stats["total"] == 0:
+        st.info("知识库为空，请上传文档。")
+    else:
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("文档块总数", stats["total"])
+        with col_b:
+            st.metric("来源文件数", len(stats["sources"]))
+        with col_c:
+            if st.button("重建 BM25 索引", use_container_width=True):
+                if st.session_state.rag:
+                    st.session_state.rag._bm25 = None
+                    _ = st.session_state.rag.bm25
+                    st.toast("BM25 索引已重建", icon=":material/check:")
+                    st.rerun()
+
+        st.markdown("**来源文件列表：**")
+        for fname, count in stats["sources"]:
+            c1, c2, c3 = st.columns([5, 2, 2])
+            with c1:
+                st.text(f"{fname}")
+            with c2:
+                st.caption(f"{count} 块")
+            with c3:
+                if st.button("删除", key=f"del_{fname}_{count}",
+                             use_container_width=True):
+                    n = vs.delete_by_source(fname)
+                    st.session_state.docs_indexed = max(
+                        0, st.session_state.docs_indexed - n)
+                    if st.session_state.rag:
+                        st.session_state.rag._bm25 = None
+                        st.session_state.rag._doc_texts = []
+                    st.toast(f"已删除「{fname}」({n} 块)", icon=":material/delete:")
+                    st.rerun()
 
 # ── 标签页 2：智能问答 ────────────────────────────────────
 
@@ -255,8 +289,7 @@ with tab_trace:
                 elif node == "execute":
                     msgs = output.get("messages", [])
                     for m in msgs:
-                        if hasattr(m, "content"):
-                            st.code(m.get("content", ""), language="text")
+                        st.code(m.get("content", ""), language="text")
 
                 elif node == "reflect":
                     decision = output.get("decision", "?")
@@ -270,8 +303,7 @@ with tab_trace:
                 elif node == "answer":
                     msgs = output.get("messages", [])
                     for m in msgs:
-                        if hasattr(m, "content"):
-                            st.markdown(m.get("content", ""))
+                        st.markdown(m.get("content", ""))
     else:
         st.info("暂无思考链记录。在「智能问答」标签页中提问即可看到 Agent 的完整思考过程。")
 
@@ -281,25 +313,24 @@ with tab_logs:
     st.markdown("### 运行日志")
     st.caption("实时日志输出，用于调试与监控。")
 
-    col_a, col_b = st.columns([1, 3])
-    with col_a:
-        log_level = st.selectbox(
-            "日志级别",
-            ["DEBUG", "INFO", "WARNING", "ERROR"],
-            index=1,
-        )
-    with col_b:
-        if st.button("刷新日志"):
-            st.rerun()
+    import io
 
-    st.code("""
-  [INFO] Chroma 向量库初始化完成：./data/chroma
-  [INFO] 检索完成：查询 "核心观点" → 返回 5 个文本块
-  [INFO] Agent 决策：tool（第 0/3 轮）
-  [INFO] 工具调用：calculator("156*32") → 4992
-  [INFO] 评估：信息充分（第 1/3 轮）
-  [INFO] 回答生成完成
-    """, language="text")
+    if "log_stream" not in st.session_state:
+        st.session_state.log_stream = io.StringIO()
+        logger.add(
+            st.session_state.log_stream,
+            level="INFO",
+            format="{time:HH:mm:ss} | {level:7} | {name}:{line} | {message}",
+        )
+
+    if st.button("刷新日志", use_container_width=True):
+        st.rerun()
+
+    log_text = st.session_state.log_stream.getvalue()
+    if log_text:
+        st.code(log_text[-5000:], language="log")  # show last 5000 chars
+    else:
+        st.info("暂无日志。等一下提问或上传文档就会有新的日志产生。")
 
 # ── 底部 ──────────────────────────────────────────────────
 
