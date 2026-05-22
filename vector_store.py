@@ -87,3 +87,15 @@ class VectorStoreManager:
             self._collection.delete(ids=ids)
             logger.info(f"Deleted {len(ids)} chunks from '{source_file}'")
         return len(ids)
+
+
+# Global singleton — reused across all RAGPipeline instances to avoid
+# reloading the 400MB embedding model on every query.
+_global_vs: Optional[VectorStoreManager] = None
+
+
+def _get_global_vs() -> VectorStoreManager:
+    global _global_vs
+    if _global_vs is None:
+        _global_vs = VectorStoreManager()
+    return _global_vs

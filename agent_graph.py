@@ -105,11 +105,12 @@ def _pick_tool(query: str) -> Optional[str]:
 
 def retrieve_node(state: AgentState) -> dict:
     from rag_pipeline import RAGPipeline
+    from vector_store import _get_global_vs
 
     last_msg = state["messages"][-1]
     query = last_msg.get("content", "") if isinstance(last_msg, dict) else ""
 
-    rag = RAGPipeline()
+    rag = RAGPipeline(vector_store=_get_global_vs())
     docs = rag.hybrid_search(query, use_rerank=True)
     logger.info(f"Retrieved {len(docs)} chunks for query: {query[:80]}...")
 

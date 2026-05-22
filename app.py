@@ -4,7 +4,7 @@ import sys
 import os
 import io
 
-# Load .env into os.environ so all modules can access it
+# Load .env into os.environ
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 日志 ──────────────────────────────────────────────────
+# ── 日志 (module-level, runs once) ────────────────────────
 
 logger.remove()
 logger.add(
@@ -24,12 +24,21 @@ logger.add(
     format="<green>{time:HH:mm:ss}</green> | <level>{level:7}</level> | <cyan>{name}</cyan> | {message}",
 )
 
+# StringIO sink for the UI log tab — add once
+if "log_sink_added" not in st.session_state:
+    st.session_state.log_sink_added = True
+    st.session_state.log_stream = io.StringIO()
+    logger.add(
+        st.session_state.log_stream,
+        level="INFO",
+        format="{time:HH:mm:ss} | {level:7} | {name}:{line} | {message}",
+    )
+
 # ── 样式 ──────────────────────────────────────────────────
 
 st.markdown("""
 <style>
     .main-header { font-size: 2rem; font-weight: 700; color: #1A5276; margin-bottom: 0; }
-    .sub-header { font-size: 1rem; color: #5D6D7E; margin-top: 0; }
     .trace-step { padding: 0.5rem; border-left: 3px solid #2E86C1; margin: 0.3rem 0; background: #EBF5FB; border-radius: 4px; }
     .trace-step.active { border-left-color: #E74C3C; background: #FDEDEC; }
 </style>
@@ -39,26 +48,27 @@ st.markdown("""
 
 DEFAULTS = {
     "rag": None, "docs_indexed": 0, "chat_history": [],
-    "agent_trace": [], "human_confirm_pending": False,
-    "compiled_graph": None, "thread_id": None,
-    "vs": None,  # cached VectorStoreManager (expensive to init)
+    "agent_trace": [], "thread_id": None,
+    "graph_ready": False,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Load expensive singletons once
+# Lazy-load heavy modules (avoids 7s import of sentence_transformers at startup)
 from config import settings
-from agent_graph import compile_graph
 
-if st.session_state.compiled_graph is None:
-    st.session_state.compiled_graph = compile_graph()
 
-from vector_store import VectorStoreManager
+@st.cache_resource
+def get_compiled_graph():
+    from agent_graph import compile_graph
+    return compile_graph()
+
 
 @st.cache_resource
 def get_vector_store():
-    return VectorStoreManager()
+    from vector_store import _get_global_vs
+    return _get_global_vs()
 
 
 # ── 侧栏 ──────────────────────────────────────────────────
@@ -66,7 +76,6 @@ def get_vector_store():
 with st.sidebar:
     st.markdown('<p class="main-header"> 知识工作台</p>', unsafe_allow_html=True)
     st.caption("RAG + LangGraph + MCP 本地智能助手")
-
     st.divider()
 
     api_key = settings.openai_api_key
@@ -90,7 +99,6 @@ with st.sidebar:
         st.metric("对话轮数", len(st.session_state.chat_history) // 2)
 
     st.divider()
-
     if st.button("清空对话历史", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.agent_trace = []
@@ -119,7 +127,6 @@ with tab_docs:
     st.caption("上传文档构建知识库，支持 PDF、Word、Markdown、TXT 格式。")
 
     col1, col2 = st.columns([2, 1])
-
     with col1:
         uploaded = st.file_uploader(
             "拖拽或选择文件",
@@ -127,7 +134,6 @@ with tab_docs:
             accept_multiple_files=True,
             label_visibility="collapsed",
         )
-
     with col2:
         chunk_size = st.slider("分块大小", 256, 1024, 512, step=64)
         overlap = st.slider("重叠字数", 32, 256, 128, step=32)
@@ -137,14 +143,12 @@ with tab_docs:
         rag = RAGPipeline()
         progress = st.progress(0)
         status = st.status("正在处理文档...")
-
         total = 0
         for i, f in enumerate(uploaded):
             tmp = f"/tmp/{f.name}"
             os.makedirs("/tmp", exist_ok=True)
             with open(tmp, "wb") as fp:
                 fp.write(f.getbuffer())
-
             with status:
                 st.write(f"解析中：{f.name}")
                 try:
@@ -153,13 +157,10 @@ with tab_docs:
                     st.write(f"  → 生成 {n} 个文本块")
                 except Exception as e:
                     st.error(f"解析失败：{e}")
-
             os.remove(tmp)
             progress.progress((i + 1) / len(uploaded))
-
         st.session_state.rag = rag
         st.session_state.docs_indexed += total
-        # Clear VS cache so it reloads with new data
         get_vector_store.clear()
         status.update(label=f"入库完成：{total} 个文本块，来自 {len(uploaded)} 个文件", state="complete")
         st.toast(f"已索引 {total} 个文本块", icon=":material/check:")
@@ -168,7 +169,7 @@ with tab_docs:
     # ── 知识库管理 ──────────────────────────────────────
     st.divider()
     st.markdown("### 知识库管理")
-
+    vs = get_vector_store()
     stats = vs.get_stats()
 
     if stats["total"] == 0:
@@ -198,8 +199,7 @@ with tab_docs:
                 if st.button("删除", key=f"del_{fname}_{count}",
                              use_container_width=True):
                     n = vs.delete_by_source(fname)
-                    st.session_state.docs_indexed = max(
-                        0, st.session_state.docs_indexed - n)
+                    st.session_state.docs_indexed = max(0, st.session_state.docs_indexed - n)
                     if st.session_state.rag:
                         st.session_state.rag._bm25 = None
                         st.session_state.rag._doc_texts = []
@@ -229,10 +229,8 @@ with tab_qa:
         with st.chat_message("assistant"):
             agent_status = st.status("Agent 思考中...", expanded=True)
             try:
-                app = st.session_state.compiled_graph
+                app = get_compiled_graph()
 
-                # Only pass the latest user message — LangGraph checkpoint
-                # (MemorySaver) accumulates history across turns via thread_id.
                 inputs = {
                     "messages": [{"role": "user", "content": query}],
                     "retrieved_docs": [],
@@ -242,7 +240,6 @@ with tab_qa:
                     "decision": "",
                 }
 
-                # Persistent thread_id for conversation memory
                 if st.session_state.thread_id is None:
                     import uuid
                     st.session_state.thread_id = str(uuid.uuid4())
@@ -259,10 +256,7 @@ with tab_qa:
                         trace.append({"node": node_name, "output": output})
 
                         if node_name == "human_confirm":
-                            st.warning("需要人工确认，请在弹出的对话框中操作")
-                            st.session_state.human_confirm_pending = True
-                            st.session_state.confirm_action = output
-
+                            st.warning("需要人工确认")
                         if node_name == "answer":
                             msgs = output.get("messages", [])
                             if msgs:
@@ -276,9 +270,7 @@ with tab_qa:
 
         if final_answer:
             st.markdown(final_answer)
-            st.session_state.chat_history.append({
-                "role": "assistant", "content": final_answer
-            })
+            st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
         else:
             st.info("Agent 未生成最终回答，请重试。")
 
@@ -309,31 +301,25 @@ with tab_trace:
 
                 elif node == "decide":
                     decision = output.get("decision", "?")
-                    desc = {
-                        "tool": "调用工具",
-                        "answer": "直接回答",
-                        "retrieve_again": "重新检索",
-                        "human_confirm": "请求人工确认",
-                    }
+                    desc = {"tool": "调用工具", "answer": "直接回答",
+                            "retrieve_again": "重新检索", "human_confirm": "请求人工确认"}
                     st.write(f"决策结果：**{desc.get(decision, decision)}**")
 
                 elif node == "execute":
-                    msgs = output.get("messages", [])
-                    for m in msgs:
+                    for m in output.get("messages", []):
                         st.code(m.get("content", ""), language="text")
 
                 elif node == "reflect":
                     decision = output.get("decision", "?")
-                    loop_count = output.get("loop_count", "?")
+                    lc = output.get("loop_count", "?")
                     desc = {"continue": "信息不足，继续规划", "end": "信息充分，生成回答"}
-                    st.write(f"评估结论：**{desc.get(decision, decision)}**（第 {loop_count} 轮）")
+                    st.write(f"评估结论：**{desc.get(decision, decision)}**（第 {lc} 轮）")
 
                 elif node == "human_confirm":
                     st.warning("Agent 暂停，等待用户在 UI 中确认操作")
 
                 elif node == "answer":
-                    msgs = output.get("messages", [])
-                    for m in msgs:
+                    for m in output.get("messages", []):
                         st.markdown(m.get("content", ""))
     else:
         st.info("暂无思考链记录。在「智能问答」标签页中提问即可看到 Agent 的完整思考过程。")
@@ -343,18 +329,8 @@ with tab_trace:
 with tab_logs:
     st.markdown("### 运行日志")
     st.caption("实时日志输出，用于调试与监控。")
-
-    if "log_stream" not in st.session_state:
-        st.session_state.log_stream = io.StringIO()
-        logger.add(
-            st.session_state.log_stream,
-            level="INFO",
-            format="{time:HH:mm:ss} | {level:7} | {name}:{line} | {message}",
-        )
-
     if st.button("刷新日志", use_container_width=True):
         st.rerun()
-
     log_text = st.session_state.log_stream.getvalue()
     if log_text:
         st.code(log_text[-5000:], language="log")

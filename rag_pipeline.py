@@ -119,8 +119,9 @@ class RecursiveCharacterTextSplitter:
 # ── RAG Pipeline ────────────────────────────────────────────
 
 class RAGPipeline:
-    def __init__(self, persist_dir: Optional[str] = None):
-        self.vs = VectorStoreManager(persist_dir)
+    def __init__(self, persist_dir: Optional[str] = None,
+                 vector_store: "VectorStoreManager" = None):
+        self.vs = vector_store or VectorStoreManager(persist_dir)
         self._doc_texts: List[str] = []
         self._bm25: Optional[BM25Okapi] = None
         self.splitter = RecursiveCharacterTextSplitter(
