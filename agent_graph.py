@@ -58,12 +58,23 @@ def _tool_results(messages: list) -> list:
 def _node_context(state: AgentState) -> dict:
     """Extract commonly used values from state for downstream nodes."""
     msgs = state["messages"]
+    # Build conversation history string for prompts
+    history_parts = []
+    for m in msgs:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if role == "user":
+            history_parts.append(f"用户: {content}")
+        elif role == "assistant":
+            history_parts.append(f"助手: {content[:200]}")
+    history_str = "\n".join(history_parts[-10:])  # last 10 turns
     return {
         "msgs": msgs,
         "last_user": _last_user_msg(msgs),
         "docs": state.get("retrieved_docs", []),
         "tool_msgs": _tool_results(msgs),
         "loop_count": state.get("loop_count", 0),
+        "history": history_str,
     }
 
 
@@ -116,7 +127,10 @@ def decide_node(state: AgentState) -> dict:
 
     prompt = f"""You are an AI assistant deciding the next action.
 
-User query: {query}
+CONVERSATION HISTORY:
+{ctx['history'] or '(new conversation)'}
+
+Current user query: {query}
 
 Retrieved documents ({len(ctx['docs'])} total):
 {doc_summary or '(none)'}
@@ -235,6 +249,9 @@ def answer_node(state: AgentState) -> dict:
 
     answer_prompt = f"""You are a helpful AI assistant. Answer the user's question based on the provided context.
 
+CONVERSATION HISTORY:
+{ctx['history'] or '(new conversation)'}
+
 USER QUESTION:
 {user_query}
 
@@ -244,7 +261,7 @@ CONTEXT DOCUMENTS:
 TOOL RESULTS:
 {tools_text or '(no tools called)'}
 
-Generate a comprehensive answer in Chinese. If the context doesn't contain relevant information, answer directly based on your knowledge. If it's a simple calculation or factual question, just answer it."""
+Generate a comprehensive answer in Chinese. Reference the conversation history when the user asks follow-up questions (like "add 3" should refer to the previous calculation). If the context doesn't contain relevant information, answer directly based on your knowledge."""
 
     response = _call_llm(answer_prompt)
     logger.info(f"Answer generated: {response[:100]}...")

@@ -231,13 +231,10 @@ with tab_qa:
             try:
                 app = st.session_state.compiled_graph
 
-                # Build messages from chat history (user+assistant turns)
-                history_msgs = []
-                for m in st.session_state.chat_history:
-                    history_msgs.append({"role": m["role"], "content": m["content"]})
-
+                # Only pass the latest user message — LangGraph checkpoint
+                # (MemorySaver) accumulates history across turns via thread_id.
                 inputs = {
-                    "messages": history_msgs,
+                    "messages": [{"role": "user", "content": query}],
                     "retrieved_docs": [],
                     "tool_calls": [],
                     "need_human_confirm": False,
