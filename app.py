@@ -2,6 +2,11 @@ import streamlit as st
 from loguru import logger
 import sys
 import os
+import io
+
+# Load .env into os.environ so all modules can access it
+from dotenv import load_dotenv
+load_dotenv()
 
 st.set_page_config(
     page_title="本地知识工作台",
@@ -33,12 +38,28 @@ st.markdown("""
 # ── 会话状态 ──────────────────────────────────────────────
 
 DEFAULTS = {
-    "rag": None, "agent": None, "docs_indexed": 0, "chat_history": [],
-    "agent_trace": [], "human_confirm_pending": False, "confirm_action": None,
+    "rag": None, "docs_indexed": 0, "chat_history": [],
+    "agent_trace": [], "human_confirm_pending": False,
+    "compiled_graph": None, "thread_id": None,
+    "vs": None,  # cached VectorStoreManager (expensive to init)
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Load expensive singletons once
+from config import settings
+from agent_graph import compile_graph
+
+if st.session_state.compiled_graph is None:
+    st.session_state.compiled_graph = compile_graph()
+
+from vector_store import VectorStoreManager
+
+@st.cache_resource
+def get_vector_store():
+    return VectorStoreManager()
+
 
 # ── 侧栏 ──────────────────────────────────────────────────
 
@@ -48,23 +69,23 @@ with st.sidebar:
 
     st.divider()
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = settings.openai_api_key
     if api_key and api_key not in ("sk-your-key-here", "sk-your-deepseek-key"):
-        model = os.getenv("MODEL_NAME", "deepseek-chat")
-        st.success(f"API 已连接：{model}")
+        st.success(f"API 已连接：{settings.model_name}")
     else:
         st.error("API Key 未配置")
         with st.expander("配置密钥"):
             key = st.text_input("DeepSeek API Key", type="password")
             if key:
                 os.environ["OPENAI_API_KEY"] = key
-                from config import settings
                 settings.openai_api_key = key
                 st.rerun()
 
     st.divider()
 
-    st.metric("已索引文档块", st.session_state.docs_indexed)
+    vs = get_vector_store()
+    total_docs = vs._collection.count()
+    st.metric("已索引文档块", total_docs)
     if st.session_state.chat_history:
         st.metric("对话轮数", len(st.session_state.chat_history) // 2)
 
@@ -73,6 +94,7 @@ with st.sidebar:
     if st.button("清空对话历史", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.agent_trace = []
+        st.session_state.thread_id = None
         st.rerun()
 
 # ── 标签页 ────────────────────────────────────────────────
@@ -137,6 +159,8 @@ with tab_docs:
 
         st.session_state.rag = rag
         st.session_state.docs_indexed += total
+        # Clear VS cache so it reloads with new data
+        get_vector_store.clear()
         status.update(label=f"入库完成：{total} 个文本块，来自 {len(uploaded)} 个文件", state="complete")
         st.toast(f"已索引 {total} 个文本块", icon=":material/check:")
         st.rerun()
@@ -145,8 +169,6 @@ with tab_docs:
     st.divider()
     st.markdown("### 知识库管理")
 
-    from vector_store import VectorStoreManager
-    vs = VectorStoreManager()
     stats = vs.get_stats()
 
     if stats["total"] == 0:
@@ -181,6 +203,7 @@ with tab_docs:
                     if st.session_state.rag:
                         st.session_state.rag._bm25 = None
                         st.session_state.rag._doc_texts = []
+                    get_vector_store.clear()
                     st.toast(f"已删除「{fname}」({n} 块)", icon=":material/delete:")
                     st.rerun()
 
@@ -188,7 +211,7 @@ with tab_docs:
 
 with tab_qa:
     st.markdown("### 智能问答")
-    st.caption("Agent 会检索相关文档，必要时调用工具来回答你的问题。")
+    st.caption("Agent 会检索相关文档，必要时调用工具来回答你的问题。对话历史自动保留。")
 
     chat_container = st.container(height=420)
     with chat_container:
@@ -204,13 +227,17 @@ with tab_qa:
         trace = []
 
         with st.chat_message("assistant"):
-            with st.status("Agent 思考中...", expanded=True) as agent_status:
-                from agent_graph import compile_graph
+            agent_status = st.status("Agent 思考中...", expanded=True)
+            try:
+                app = st.session_state.compiled_graph
 
-                app = compile_graph()
+                # Build messages from chat history (user+assistant turns)
+                history_msgs = []
+                for m in st.session_state.chat_history:
+                    history_msgs.append({"role": m["role"], "content": m["content"]})
 
                 inputs = {
-                    "messages": [{"role": "user", "content": query}],
+                    "messages": history_msgs,
                     "retrieved_docs": [],
                     "tool_calls": [],
                     "need_human_confirm": False,
@@ -218,7 +245,11 @@ with tab_qa:
                     "decision": "",
                 }
 
-                config = {"configurable": {"thread_id": "main"}}
+                # Persistent thread_id for conversation memory
+                if st.session_state.thread_id is None:
+                    import uuid
+                    st.session_state.thread_id = str(uuid.uuid4())
+                config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
                 final_answer = ""
                 for event in app.stream(inputs, config, stream_mode="updates"):
@@ -241,14 +272,18 @@ with tab_qa:
                                 final_answer = msgs[-1].get("content", "")
 
                 agent_status.update(label="思考完成", state="complete")
+            except Exception as e:
+                agent_status.update(label=f"出错了: {e}", state="error")
+                logger.exception("Agent execution failed")
+                final_answer = f"抱歉，处理请求时出错：{e}"
 
-            if final_answer:
-                st.markdown(final_answer)
-                st.session_state.chat_history.append({
-                    "role": "assistant", "content": final_answer
-                })
-            else:
-                st.info("Agent 未生成最终回答，请重试。")
+        if final_answer:
+            st.markdown(final_answer)
+            st.session_state.chat_history.append({
+                "role": "assistant", "content": final_answer
+            })
+        else:
+            st.info("Agent 未生成最终回答，请重试。")
 
         st.session_state.agent_trace = trace
         st.rerun()
@@ -273,7 +308,6 @@ with tab_trace:
                     st.write(f"检索到 {len(docs)} 篇相关文档")
                     for d in docs[:5]:
                         src = d.metadata.get("source_file", "未知来源")
-                        score = d.metadata.get("score", "")
                         st.caption(f"📄 [{src}] {d.page_content[:200]}...")
 
                 elif node == "decide":
@@ -313,8 +347,6 @@ with tab_logs:
     st.markdown("### 运行日志")
     st.caption("实时日志输出，用于调试与监控。")
 
-    import io
-
     if "log_stream" not in st.session_state:
         st.session_state.log_stream = io.StringIO()
         logger.add(
@@ -328,7 +360,7 @@ with tab_logs:
 
     log_text = st.session_state.log_stream.getvalue()
     if log_text:
-        st.code(log_text[-5000:], language="log")  # show last 5000 chars
+        st.code(log_text[-5000:], language="log")
     else:
         st.info("暂无日志。等一下提问或上传文档就会有新的日志产生。")
 
