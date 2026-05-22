@@ -15,24 +15,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 日志 (module-level, runs once) ────────────────────────
+# ── 日志 ──────────────────────────────────────────────────
 
 logger.remove()
+
 logger.add(
     sys.stderr,
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="<green>{time:HH:mm:ss}</green> | <level>{level:7}</level> | <cyan>{name}</cyan> | {message}",
 )
 
-# StringIO sink for the UI log tab — add once
-if "log_sink_added" not in st.session_state:
-    st.session_state.log_sink_added = True
+# StringIO sink — re-add on every rerun (logger.remove() wipes all sinks)
+if "log_stream" not in st.session_state:
     st.session_state.log_stream = io.StringIO()
-    logger.add(
-        st.session_state.log_stream,
-        level="INFO",
-        format="{time:HH:mm:ss} | {level:7} | {name}:{line} | {message}",
-    )
+logger.add(
+    st.session_state.log_stream,
+    level="DEBUG",
+    format="{time:HH:mm:ss} | {level:7} | {name}:{line} | {message}",
+)
 
 # ── 样式 ──────────────────────────────────────────────────
 
