@@ -1,17 +1,15 @@
 import pytest
 
 
-@pytest.mark.asyncio
-async def test_calculator_tool():
+def test_calculator_tool():
     from tools.calculator import calculator
-    result = calculator.invoke("12 * 13")
+    result = calculator("12 * 13")
     assert "156" in result
 
 
-@pytest.mark.asyncio
-async def test_datetime_tool():
+def test_datetime_tool():
     from tools.datetime_tool import datetime_tool
-    result = datetime_tool.invoke("today")
+    result = datetime_tool(action="today")
     assert len(result) == 10  # YYYY-MM-DD
 
 

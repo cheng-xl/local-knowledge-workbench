@@ -1,10 +1,9 @@
-from typing import TypedDict, List, Annotated, Literal
+from typing import TypedDict, List, Annotated, Literal, Optional
 import operator
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from shared import Document
 from config import settings
 from loguru import logger
 
@@ -12,7 +11,7 @@ from loguru import logger
 # ── State ──────────────────────────────────────────────────
 
 class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], operator.add]
+    messages: Annotated[List[dict], operator.add]
     retrieved_docs: List[Document]
     tool_calls: List[dict]
     need_human_confirm: bool
@@ -24,19 +23,37 @@ MAX_LOOPS = settings.max_loops
 
 # ── LLM ────────────────────────────────────────────────────
 
-_llm: ChatOpenAI | None = None
+_llm: Optional[OpenAI] = None
 
 
-def get_llm() -> ChatOpenAI:
+def get_llm() -> OpenAI:
     global _llm
     if _llm is None:
-        _llm = ChatOpenAI(
-            model=settings.model_name,
+        _llm = OpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
-            temperature=0.3,
         )
     return _llm
+
+
+def _call_llm(prompt: str) -> str:
+    resp = get_llm().chat.completions.create(
+        model=settings.model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content
+
+
+def _last_user_msg(messages: list) -> Optional[dict]:
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return m
+    return None
+
+
+def _tool_results(messages: list) -> list:
+    return [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
 
 
 # ── Tool registry ──────────────────────────────────────────
@@ -46,6 +63,7 @@ from tools.datetime_tool import datetime_tool
 
 LOCAL_TOOLS = {"calculator": calculator, "datetime_tool": datetime_tool}
 
+
 # ── Nodes ──────────────────────────────────────────────────
 
 
@@ -53,7 +71,7 @@ def retrieve_node(state: AgentState) -> dict:
     from rag_pipeline import RAGPipeline
 
     last_msg = state["messages"][-1]
-    query = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+    query = last_msg.get("content", "") if isinstance(last_msg, dict) else ""
 
     rag = RAGPipeline()
     docs = rag.hybrid_search(query, use_rerank=True)
@@ -64,15 +82,11 @@ def retrieve_node(state: AgentState) -> dict:
 
 def decide_node(state: AgentState) -> dict:
     msgs = state["messages"]
-    last_user = next(
-        (m for m in reversed(msgs) if isinstance(m, HumanMessage)), None
-    )
-    query = last_user.content if last_user else ""
+    last_user = _last_user_msg(msgs)
+    query = last_user.get("content", "") if last_user else ""
     docs = state.get("retrieved_docs", [])
     loop_count = state.get("loop_count", 0)
-    tool_results = [
-        m for m in msgs if isinstance(m, ToolMessage)
-    ]
+    tool_msgs = _tool_results(msgs)
 
     doc_summary = "\n".join(
         f"[{i+1}] {d.metadata.get('source_file', '?')}: {d.page_content[:200]}..."
@@ -86,8 +100,8 @@ User query: {query}
 Retrieved documents ({len(docs)} total):
 {doc_summary or '(none)'}
 
-Tool results so far ({len(tool_results)}):
-{[m.content[:300] for m in tool_results[-3:]] or '(none)'}
+Tool results so far ({len(tool_msgs)}):
+{[m.get('content', '')[:300] for m in tool_msgs[-3:]] or '(none)'}
 
 Loop count: {loop_count}/{MAX_LOOPS}
 
@@ -97,9 +111,8 @@ Decide the next step. Reply with EXACTLY ONE WORD:
 - retrieve_again: need to search with a different query
 - human_confirm: need user permission for a sensitive operation"""
 
-    llm = get_llm()
-    response = llm.invoke(prompt)
-    decision = response.content.strip().lower()
+    response = _call_llm(prompt)
+    decision = response.strip().lower()
 
     valid = {"tool", "answer", "retrieve_again", "human_confirm"}
     if decision not in valid:
@@ -111,17 +124,14 @@ Decide the next step. Reply with EXACTLY ONE WORD:
 
 
 def execute_node(state: AgentState) -> dict:
-    decision = state.get("decision", "answer")
-    if decision != "tool":
+    if state.get("decision") != "tool":
         return {}
 
-    messages = state["messages"]
-    last_user = next(
-        (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
-    )
+    msgs = state["messages"]
+    last_user = _last_user_msg(msgs)
 
     prompt = f"""You have access to these tools: {', '.join(LOCAL_TOOLS.keys())}
-User request: {last_user.content if last_user else 'No query'}
+User request: {last_user.get('content', '') if last_user else 'No query'}
 
 If the user wants a calculation, respond with: calculator("expression")
 If the user wants date/time, respond with: datetime_tool("action")
@@ -129,9 +139,8 @@ Otherwise respond: none
 
 Respond with ONLY the tool call in the exact format above, nothing else."""
 
-    llm = get_llm()
-    response = llm.invoke(prompt)
-    text = response.content.strip()
+    response = _call_llm(prompt)
+    text = response.strip()
     logger.info(f"Execute LLM response: {text[:100]}")
 
     result_msg = None
@@ -142,27 +151,30 @@ Respond with ONLY the tool call in the exact format above, nothing else."""
                 match = re.search(rf'{name}\(\s*"([^"]*)"\s*\)', text)
                 arg = match.group(1) if match else ""
                 tool_fn = LOCAL_TOOLS[name]
-                result = tool_fn.invoke(arg if arg else None)
-                result_msg = ToolMessage(
-                    content=str(result),
-                    tool_call_id=f"call_{name}",
-                    name=name,
-                )
+                result = tool_fn(arg)
+                result_msg = {
+                    "role": "tool",
+                    "content": str(result),
+                    "tool_call_id": f"call_{name}",
+                    "name": name,
+                }
                 logger.info(f"Tool {name}({arg}) -> {str(result)[:80]}")
             except Exception as e:
-                result_msg = ToolMessage(
-                    content=f"Error calling {name}: {e}",
-                    tool_call_id=f"call_{name}",
-                    name=name,
-                )
+                result_msg = {
+                    "role": "tool",
+                    "content": f"Error calling {name}: {e}",
+                    "tool_call_id": f"call_{name}",
+                    "name": name,
+                }
             break
 
     if result_msg is None:
-        result_msg = ToolMessage(
-            content=text,
-            tool_call_id="call_unknown",
-            name="unknown",
-        )
+        result_msg = {
+            "role": "tool",
+            "content": text,
+            "tool_call_id": "call_unknown",
+            "name": "unknown",
+        }
 
     return {"messages": [result_msg], "tool_calls": []}
 
@@ -174,29 +186,24 @@ def reflect_node(state: AgentState) -> dict:
         logger.warning(f"Max loops ({MAX_LOOPS}) reached, forcing end")
         return {"loop_count": loop_count, "decision": "end"}
 
-    tool_results = [
-        m for m in state["messages"] if isinstance(m, ToolMessage)
-    ]
+    msgs = state["messages"]
     docs = state.get("retrieved_docs", [])
-    last_user = next(
-        (m for m in reversed(state["messages"])
-         if isinstance(m, HumanMessage)), None
-    )
+    last_user = _last_user_msg(msgs)
+    tool_msgs = _tool_results(msgs)
 
     prompt = f"""Evaluate whether we have enough information to answer the user's question.
 
-User query: {last_user.content if last_user else 'N/A'}
+User query: {last_user.get('content', '') if last_user else 'N/A'}
 Documents retrieved: {len(docs)}
-Tool results: {len(tool_results)}
+Tool results: {len(tool_msgs)}
 Loop: {loop_count}/{MAX_LOOPS}
 
 Reply with EXACTLY ONE WORD:
 - continue: need more information, go back to decide
 - end: have enough to answer"""
 
-    llm = get_llm()
-    response = llm.invoke(prompt)
-    decision = response.content.strip().lower()
+    response = _call_llm(prompt)
+    decision = response.strip().lower()
 
     if decision not in ("continue", "end"):
         decision = "end"
@@ -211,11 +218,10 @@ def human_node(state: AgentState) -> dict:
 
 
 def answer_node(state: AgentState) -> dict:
-    messages = state["messages"]
+    msgs = state["messages"]
     docs = state.get("retrieved_docs", [])
-    tool_results = [
-        m for m in messages if isinstance(m, ToolMessage)
-    ]
+    last_user = _last_user_msg(msgs)
+    tool_msgs = _tool_results(msgs)
 
     context = "\n\n".join(
         f"[Doc {i+1} from {d.metadata.get('source_file', '?')}]\n{d.page_content}"
@@ -223,13 +229,11 @@ def answer_node(state: AgentState) -> dict:
     )
 
     tools_text = "\n".join(
-        f"[{m.name}] {m.content}" for m in tool_results
+        f"[{m.get('name', '?')}] {m.get('content', '')}"
+        for m in tool_msgs
     )
 
-    last_user = next(
-        (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
-    )
-    user_query = last_user.content if last_user else "(no query)"
+    user_query = last_user.get("content", "") if last_user else "(no query)"
 
     answer_prompt = f"""You are a helpful AI assistant. Answer the user's question based on the provided context.
 
@@ -244,11 +248,11 @@ TOOL RESULTS:
 
 Generate a comprehensive answer in Chinese. If the context doesn't contain relevant information, answer directly based on your knowledge. If it's a simple calculation or factual question, just answer it."""
 
-    llm = get_llm()
-    response = llm.invoke(answer_prompt)
-    logger.info(f"Answer generated: {response.content[:100]}...")
+    response = _call_llm(answer_prompt)
+    logger.info(f"Answer generated: {response[:100]}...")
 
-    return {"messages": [response], "need_human_confirm": False}
+    return {"messages": [{"role": "assistant", "content": response}],
+            "need_human_confirm": False}
 
 
 # ── Router functions ───────────────────────────────────────

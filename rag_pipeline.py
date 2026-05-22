@@ -1,72 +1,152 @@
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader,
-    UnstructuredMarkdownLoader,
-)
-from langchain_community.retrievers import BM25Retriever
+import os
+import hashlib
+from typing import List, Optional, Dict
+from rank_bm25 import BM25Okapi
 from vector_store import VectorStoreManager
+from shared import Document
 from config import settings
 from loguru import logger
-from typing import List, Optional
-import hashlib
-import os
 
+
+# ── Document loaders ────────────────────────────────────────
+
+def _load_pdf(file_path: str) -> List[Document]:
+    from pypdf import PdfReader
+    reader = PdfReader(file_path)
+    docs = []
+    fname = os.path.basename(file_path)
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text and text.strip():
+            docs.append(Document(page_content=text.strip(),
+                        metadata={"source_file": fname, "file_type": "pdf",
+                                  "page": i + 1}))
+    return docs
+
+
+def _load_docx(file_path: str) -> List[Document]:
+    from docx import Document as DocxDocument
+    doc = DocxDocument(file_path)
+    text = "\n".join(p.text for p in doc.paragraphs if p.text)
+    fname = os.path.basename(file_path)
+    return [Document(page_content=text,
+                     metadata={"source_file": fname, "file_type": "docx"})]
+
+
+def _load_text(file_path: str) -> List[Document]:
+    fname = os.path.basename(file_path)
+    ext = file_path.rsplit(".", 1)[-1].lower()
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    return [Document(page_content=text,
+                     metadata={"source_file": fname, "file_type": ext})]
+
+
+_LOADERS: Dict[str, callable] = {
+    "pdf": _load_pdf,
+    "docx": _load_docx,
+    "md": _load_text,
+    "txt": _load_text,
+}
+
+
+# ── Text splitter ───────────────────────────────────────────
+
+class RecursiveCharacterTextSplitter:
+    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 128,
+                 separators: list = None):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.separators = separators or ["\n\n", "\n", "。", ".", " ", ""]
+
+    def split_text(self, text: str) -> List[str]:
+        if len(text) <= self.chunk_size:
+            return [text]
+        chunks = []
+        current = ""
+        for para in text.split(self.separators[0]):
+            candidate = (current + self.separators[0] + para).strip() if current else para
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                if len(para) > self.chunk_size:
+                    for sub in self._split_long(para):
+                        chunks.append(sub)
+                    current = ""
+                else:
+                    current = para
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _split_long(self, text: str) -> List[str]:
+        for sep in self.separators[1:]:
+            if sep and sep in text:
+                parts = text.split(sep)
+                chunks = []
+                current = ""
+                for part in parts:
+                    candidate = (current + sep + part).strip() if current else part
+                    if len(candidate) <= self.chunk_size:
+                        current = candidate
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = part
+                if current:
+                    chunks.append(current)
+                return chunks
+        step = self.chunk_size - self.chunk_overlap
+        return [text[i:i + self.chunk_size] for i in range(0, len(text), step)]
+
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        chunks = []
+        for doc in documents:
+            texts = self.split_text(doc.page_content)
+            for text in texts:
+                new_doc = Document(
+                    page_content=text,
+                    metadata=dict(doc.metadata),
+                )
+                chunks.append(new_doc)
+        return chunks
+
+
+# ── RAG Pipeline ────────────────────────────────────────────
 
 class RAGPipeline:
     def __init__(self, persist_dir: Optional[str] = None):
         self.vs = VectorStoreManager(persist_dir)
         self._doc_texts: List[str] = []
-        self._bm25: Optional[BM25Retriever] = None
+        self._bm25: Optional[BM25Okapi] = None
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
-            separators=["\n\n", "\n", "。", ".", " ", ""],
         )
-
-    # ── Document loading ──────────────────────────────────
-
-    _LOADERS = {
-        "pdf": PyPDFLoader,
-        "docx": Docx2txtLoader,
-        "md": UnstructuredMarkdownLoader,
-        "txt": TextLoader,
-    }
 
     def load_document(self, file_path: str) -> List[Document]:
         ext = file_path.rsplit(".", 1)[-1].lower()
-        loader_cls = self._LOADERS.get(ext, TextLoader)
-        logger.info(f"Loading {file_path} with {loader_cls.__name__}")
-        docs = loader_cls(file_path).load()
-        for d in docs:
-            d.metadata.setdefault("source_file", os.path.basename(file_path))
-            d.metadata.setdefault("file_type", ext)
-        return docs
+        loader = _LOADERS.get(ext, _load_text)
+        logger.info(f"Loading {file_path} ({ext})")
+        return loader(file_path)
 
-    # ── Chunking ───────────────────────────────────────────
-
-    def chunk_documents(
-        self, docs: List[Document], chunk_size: int = None, overlap: int = None
-    ) -> List[Document]:
+    def chunk_documents(self, docs: List[Document],
+                        chunk_size: int = None,
+                        overlap: int = None) -> List[Document]:
         cs = chunk_size or settings.chunk_size
         ov = overlap or settings.chunk_overlap
-        if cs != self.splitter._chunk_size:
+        if cs != self.splitter.chunk_size or ov != self.splitter.chunk_overlap:
             self.splitter = RecursiveCharacterTextSplitter(
-                chunk_size=cs, chunk_overlap=ov,
-                separators=["\n\n", "\n", "。", ".", " ", ""],
-            )
+                chunk_size=cs, chunk_overlap=ov)
         chunks = self.splitter.split_documents(docs)
         for i, c in enumerate(chunks):
             c.metadata["chunk_index"] = i
             c.metadata["chunk_hash"] = hashlib.md5(
-                c.page_content.encode()
-            ).hexdigest()[:8]
+                c.page_content.encode()).hexdigest()[:8]
         logger.info(f"Split {len(docs)} docs into {len(chunks)} chunks")
         return chunks
-
-    # ── Indexing ───────────────────────────────────────────
 
     def add_to_store(self, chunks: List[Document]) -> List[str]:
         ids = self.vs.add_documents(chunks)
@@ -74,54 +154,54 @@ class RAGPipeline:
         self._bm25 = None
         return ids
 
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        try:
+            import jieba
+            return list(jieba.cut(text))
+        except ImportError:
+            return list(text)
+
     @property
-    def bm25(self) -> Optional[BM25Retriever]:
+    def bm25(self) -> Optional[BM25Okapi]:
         if self._bm25 is None and self._doc_texts:
             logger.info(f"Building BM25 index on {len(self._doc_texts)} chunks")
-            self._bm25 = BM25Retriever.from_texts(
-                self._doc_texts,
-                preprocess_func=lambda x: x,
-            )
+            corpus = [self._tokenize(t) for t in self._doc_texts]
+            self._bm25 = BM25Okapi(corpus)
         return self._bm25
 
-    # ── Retrieval ──────────────────────────────────────────
-
-    def hybrid_search(
-        self, query: str, top_k: int = None, use_rerank: bool = True
-    ) -> List[Document]:
+    def hybrid_search(self, query: str, top_k: int = None,
+                      use_rerank: bool = True) -> List[Document]:
         k = top_k or settings.retrieval_top_k
 
-        # Vector search
         vec_results = self.vs.search(query, top_k=k * 2)
         logger.debug(f"Vector search returned {len(vec_results)} results")
 
-        # BM25 search
         bm25_results = []
         if self.bm25 is not None:
-            bm25_results = self.bm25.get_relevant_documents(query, k=k * 2)
+            scores = self.bm25.get_scores(self._tokenize(query))
+            top_idx = sorted(range(len(scores)),
+                             key=lambda i: scores[i], reverse=True)[:k * 2]
+            bm25_results = [
+                Document(page_content=self._doc_texts[i],
+                         metadata={"bm25_score": float(scores[i]),
+                                   "source_file": "bm25"})
+                for i in top_idx if scores[i] > 0
+            ]
             logger.debug(f"BM25 returned {len(bm25_results)} results")
 
-        # RRF fusion
         merged = self._rrf(vec_results, bm25_results)
-
-        # Optional rerank
         if use_rerank and len(merged) > k:
             merged = self._rerank(query, merged)
-
         return merged[:k]
 
-    # ── RRF Fusion ─────────────────────────────────────────
-
     @staticmethod
-    def _rrf(
-        vec: List[Document], bm25: List[Document], k: int = 60
-    ) -> List[Document]:
-        scores: dict[str, tuple[Document, float]] = {}
-
+    def _rrf(vec: List[Document], bm25: List[Document],
+             k: int = 60) -> List[Document]:
+        scores: dict = {}
         for rank, doc in enumerate(vec):
             key = doc.page_content[:200]
             scores[key] = (doc, 1.0 / (k + rank + 1))
-
         for rank, doc in enumerate(bm25):
             key = doc.page_content[:200]
             rrf = 1.0 / (k + rank + 1)
@@ -129,11 +209,8 @@ class RAGPipeline:
                 scores[key] = (scores[key][0], scores[key][1] + rrf)
             else:
                 scores[key] = (doc, rrf)
-
         sorted_items = sorted(scores.values(), key=lambda x: x[1], reverse=True)
         return [item[0] for item in sorted_items]
-
-    # ── Rerank (optional, requires FlagEmbedding installed) ─
 
     @staticmethod
     def _rerank(query: str, docs: List[Document]) -> List[Document]:
@@ -148,8 +225,6 @@ class RAGPipeline:
         except ImportError:
             logger.warning("FlagEmbedding not installed, skipping rerank")
             return docs
-
-    # ── Full ingestion pipeline ────────────────────────────
 
     def ingest_file(self, file_path: str) -> int:
         docs = self.load_document(file_path)

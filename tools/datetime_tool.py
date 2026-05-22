@@ -1,11 +1,16 @@
-from langchain_core.tools import tool
 from datetime import datetime, timezone, timedelta
 
 
-@tool
 def datetime_tool(action: str = "now", timezone_offset: int = 8) -> str:
     """Get current date/time or calculate date differences.
-    Actions: 'now' | 'today' | 'weekday' | 'timestamp'."""
+
+    Args:
+        action: One of 'now' | 'today' | 'weekday' | 'timestamp'.
+        timezone_offset: UTC offset in hours (default 8 = China Standard Time).
+
+    Returns:
+        Formatted date/time string.
+    """
     now = datetime.now(timezone(timedelta(hours=timezone_offset)))
     actions = {
         "now": lambda: now.strftime("%Y-%m-%d %H:%M:%S"),

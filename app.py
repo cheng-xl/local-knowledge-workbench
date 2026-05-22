@@ -172,12 +172,11 @@ with tab_qa:
         with st.chat_message("assistant"):
             with st.status("Agent 思考中...", expanded=True) as agent_status:
                 from agent_graph import compile_graph
-                from langchain_core.messages import HumanMessage
 
                 app = compile_graph()
 
                 inputs = {
-                    "messages": [HumanMessage(content=query)],
+                    "messages": [{"role": "user", "content": query}],
                     "retrieved_docs": [],
                     "tool_calls": [],
                     "need_human_confirm": False,
@@ -205,7 +204,7 @@ with tab_qa:
                         if node_name == "answer":
                             msgs = output.get("messages", [])
                             if msgs:
-                                final_answer = msgs[-1].content
+                                final_answer = msgs[-1].get("content", "")
 
                 agent_status.update(label="思考完成", state="complete")
 
@@ -257,7 +256,7 @@ with tab_trace:
                     msgs = output.get("messages", [])
                     for m in msgs:
                         if hasattr(m, "content"):
-                            st.code(m.content, language="text")
+                            st.code(m.get("content", ""), language="text")
 
                 elif node == "reflect":
                     decision = output.get("decision", "?")
@@ -272,7 +271,7 @@ with tab_trace:
                     msgs = output.get("messages", [])
                     for m in msgs:
                         if hasattr(m, "content"):
-                            st.markdown(m.content)
+                            st.markdown(m.get("content", ""))
     else:
         st.info("暂无思考链记录。在「智能问答」标签页中提问即可看到 Agent 的完整思考过程。")
 

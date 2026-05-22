@@ -1,29 +1,14 @@
 import os
 
 from config import settings
-
-os.environ.setdefault("HF_ENDPOINT", settings.hf_endpoint or "https://hf-mirror.com")
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from sentence_transformers import SentenceTransformer
 from loguru import logger
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+from shared import Document
 from typing import List, Optional
 
-
-class STEmbeddings(Embeddings):
-    """LangChain-compatible wrapper around SentenceTransformer."""
-
-    def __init__(self, model_name: str, local_files_only: bool = False):
-        self._st = SentenceTransformer(model_name, local_files_only=local_files_only)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._st.encode(texts, normalize_embeddings=True).tolist()
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._st.encode(text, normalize_embeddings=True).tolist()
+os.environ.setdefault("HF_ENDPOINT", settings.hf_endpoint or "https://hf-mirror.com")
 
 
 class VectorStoreManager:
@@ -31,35 +16,61 @@ class VectorStoreManager:
         self.persist_dir = persist_dir or settings.chroma_persist_dir
         logger.info(f"Loading embedding model: {settings.embedding_model}")
         try:
-            self.embedding_fn = STEmbeddings(settings.embedding_model)
+            self._model = SentenceTransformer(settings.embedding_model,
+                                              local_files_only=False)
         except Exception:
             logger.warning("Online load failed, trying offline cache only")
-            self.embedding_fn = STEmbeddings(settings.embedding_model, local_files_only=True)
-        self.vectorstore = Chroma(
-            persist_directory=self.persist_dir,
-            embedding_function=self.embedding_fn,
+            self._model = SentenceTransformer(settings.embedding_model,
+                                              local_files_only=True)
+        self._client = chromadb.PersistentClient(
+            path=self.persist_dir,
+            settings=ChromaSettings(anonymized_telemetry=False),
         )
+        # 保持 "langchain" 名称以兼容现有数据
+        self._collection = self._client.get_or_create_collection(name="langchain")
         logger.info(f"Chroma initialized at {self.persist_dir}")
 
+    def _encode(self, texts: List[str]) -> List[List[float]]:
+        return self._model.encode(texts, normalize_embeddings=True).tolist()
+
     def add_documents(self, documents: List[Document]) -> List[str]:
-        ids = self.vectorstore.add_documents(documents)
+        texts = [d.page_content for d in documents]
+        embeddings = self._encode(texts)
+        ids = [f"doc_{hash(d.page_content) % (10**10)}_{i}"
+               for i, d in enumerate(documents)]
+        metadatas = [d.metadata for d in documents]
+        self._collection.add(
+            ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
         logger.info(f"Added {len(documents)} documents to Chroma")
         return ids
 
-    def search(
-        self, query: str, top_k: int = 5, filter: Optional[dict] = None
-    ) -> List[Document]:
-        return self.vectorstore.similarity_search(query, k=top_k, filter=filter)
-
-    def search_with_score(
-        self, query: str, top_k: int = 5, filter: Optional[dict] = None
-    ) -> List[tuple]:
-        return self.vectorstore.similarity_search_with_relevance_scores(
-            query, k=top_k, filter=filter
+    def search(self, query: str, top_k: int = 5,
+               filter: Optional[dict] = None) -> List[Document]:
+        query_emb = self._encode([query])
+        results = self._collection.query(
+            query_embeddings=query_emb,
+            n_results=top_k,
+            where=filter if filter else None,
         )
+        docs = []
+        ids = results.get("ids", [[]])[0]
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [None])[0] or [{}] * len(ids)
+        distances = results.get("distances", [[]])[0] or [0.0] * len(ids)
+        for i in range(len(ids)):
+            meta = metadatas[i] if i < len(metadatas) else {}
+            doc = Document(page_content=documents[i], metadata=dict(meta))
+            doc.metadata["score"] = 1.0 / (1.0 + distances[i])
+            docs.append(doc)
+        return docs
+
+    def search_with_score(self, query: str, top_k: int = 5,
+                          filter: Optional[dict] = None) -> List[tuple]:
+        docs = self.search(query, top_k=top_k, filter=filter)
+        return [(d, d.metadata.get("score", 0.0)) for d in docs]
 
     def delete_by_filter(self, filter: dict) -> None:
-        ids = self.vectorstore.get(where=filter).get("ids", [])
-        if ids:
-            self.vectorstore.delete(ids=ids)
-            logger.info(f"Deleted {len(ids)} documents matching {filter}")
+        results = self._collection.get(where=filter)
+        if results.get("ids"):
+            self._collection.delete(ids=results["ids"])
+            logger.info(f"Deleted {len(results['ids'])} documents matching {filter}")
