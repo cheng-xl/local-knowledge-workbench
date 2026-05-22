@@ -218,15 +218,15 @@ class RAGPipeline:
     @staticmethod
     def _rerank(query: str, docs: List[Document]) -> List[Document]:
         try:
-            from FlagEmbedding import FlagReranker
-            reranker = FlagReranker("BAAI/bge-reranker-base")
+            from sentence_transformers import CrossEncoder
+            model = CrossEncoder("BAAI/bge-reranker-base")
             pairs = [[query, d.page_content] for d in docs]
-            scores = reranker.compute_score(pairs, normalize=True)
+            scores = model.predict(pairs)
             scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
             logger.debug(f"Reranking: top score={scored[0][1]:.3f}")
             return [d for d, _ in scored]
-        except ImportError:
-            logger.warning("FlagEmbedding not installed, skipping rerank")
+        except Exception:
+            logger.warning("Reranker not available, skipping rerank")
             return docs
 
     def ingest_file(self, file_path: str,
