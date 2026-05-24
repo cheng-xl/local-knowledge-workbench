@@ -4,6 +4,7 @@ from typing import TypedDict, List, Annotated, Optional
 from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
 from shared import Document
 from config import settings
 from loguru import logger
@@ -230,7 +231,11 @@ Reply with EXACTLY ONE WORD:
 
 def human_node(state: AgentState) -> dict:
     logger.info("Human-in-the-Loop: awaiting user confirmation")
-    return {"need_human_confirm": True}
+    # Pause execution, return user's decision via interrupt
+    approved = interrupt("需要人工确认此操作，请在 UI 中批准或拒绝。")
+    decision = "approved" if approved else "denied"
+    logger.info(f"Human-in-the-Loop: user {decision}")
+    return {"decision": decision, "need_human_confirm": False}
 
 
 def answer_node(state: AgentState) -> dict:

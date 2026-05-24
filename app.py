@@ -49,7 +49,7 @@ st.markdown("""
 DEFAULTS = {
     "rag": None, "docs_indexed": 0, "chat_history": [],
     "agent_trace": [], "thread_id": None,
-    "graph_ready": False,
+    "pending_interrupt": False, "pending_config": None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -222,60 +222,98 @@ with tab_qa:
 
     query = st.chat_input("输入问题，例如「总结这份文档的核心观点」或「计算 156 * 32」...")
 
-    if query:
-        st.session_state.chat_history.append({"role": "user", "content": query})
+    # ── Human-in-the-Loop: resume pending interrupt ──────
+    human_confirm_action = None
+    if st.session_state.get("pending_interrupt"):
+        col_approve, col_deny = st.columns(2)
+        with col_approve:
+            if st.button("✅ 批准操作", use_container_width=True, type="primary"):
+                human_confirm_action = True
+        with col_deny:
+            if st.button("❌ 拒绝操作", use_container_width=True):
+                human_confirm_action = False
+
+    if query or human_confirm_action is not None:
+        if query:
+            st.session_state.chat_history.append({"role": "user", "content": query})
         trace = []
 
         with st.chat_message("assistant"):
             agent_status = st.status("Agent 思考中...", expanded=True)
             try:
                 app = get_compiled_graph()
-
-                inputs = {
-                    "messages": [{"role": "user", "content": query}],
-                    "retrieved_docs": [],
-                    "tool_calls": [],
-                    "need_human_confirm": False,
-                    "loop_count": 0,
-                    "decision": "",
-                }
+                final_answer = ""
 
                 if st.session_state.thread_id is None:
                     import uuid
                     st.session_state.thread_id = str(uuid.uuid4())
                 config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
-                final_answer = ""
-                for event in app.stream(inputs, config, stream_mode="updates"):
-                    for node_name, output in event.items():
-                        label = step_labels.get(node_name, f" {node_name}")
-                        st.write(
-                            f"<div class='trace-step active'>{label}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        trace.append({"node": node_name, "output": output})
+                # Resume from pending interrupt
+                if human_confirm_action is not None and st.session_state.get("pending_interrupt"):
+                    from langgraph.types import Command
+                    st.session_state.pending_interrupt = False
+                    st.session_state.pending_config = None
+                    # Resume graph with human decision
+                    for event in app.stream(
+                        Command(resume=human_confirm_action), config,
+                        stream_mode="updates",
+                    ):
+                        for node_name, output in event.items():
+                            label = step_labels.get(node_name, f" {node_name}")
+                            st.write(
+                                f"<div class='trace-step active'>{label}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            trace.append({"node": node_name, "output": output})
+                            if node_name == "answer":
+                                msgs = output.get("messages", [])
+                                if msgs:
+                                    final_answer = msgs[-1].get("content", "")
+                elif query:
+                    inputs = {
+                        "messages": [{"role": "user", "content": query}],
+                        "retrieved_docs": [],
+                        "tool_calls": [],
+                        "need_human_confirm": False,
+                        "loop_count": 0,
+                        "decision": "",
+                    }
+                    for event in app.stream(inputs, config, stream_mode="updates"):
+                        for node_name, output in event.items():
+                            label = step_labels.get(node_name, f" {node_name}")
+                            st.write(
+                                f"<div class='trace-step active'>{label}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            trace.append({"node": node_name, "output": output})
 
-                        if node_name == "human_confirm":
-                            st.warning("需要人工确认")
-                        if node_name == "answer":
-                            msgs = output.get("messages", [])
-                            if msgs:
-                                final_answer = msgs[-1].get("content", "")
+                            if node_name == "answer":
+                                msgs = output.get("messages", [])
+                                if msgs:
+                                    final_answer = msgs[-1].get("content", "")
 
                 agent_status.update(label="思考完成", state="complete")
             except Exception as e:
-                agent_status.update(label=f"出错了: {e}", state="error")
-                logger.exception("Agent execution failed")
-                final_answer = f"抱歉，处理请求时出错：{e}"
+                from langgraph.errors import GraphInterrupt
+                if isinstance(e, GraphInterrupt):
+                    agent_status.update(label="等待人工确认", state="running")
+                    st.session_state.pending_interrupt = True
+                    st.session_state.pending_config = config
+                    st.warning("Agent 请求执行敏感操作，请确认")
+                    st.rerun()
+                else:
+                    agent_status.update(label=f"出错了: {e}", state="error")
+                    logger.exception("Agent execution failed")
+                    final_answer = f"抱歉，处理请求时出错：{e}"
 
         if final_answer:
             st.markdown(final_answer)
             st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
-        else:
-            st.info("Agent 未生成最终回答，请重试。")
 
         st.session_state.agent_trace = trace
-        st.rerun()
+        if not st.session_state.get("pending_interrupt"):
+            st.rerun()
 
 # ── 标签页 3：思考链追踪 ──────────────────────────────────
 
