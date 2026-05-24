@@ -51,7 +51,7 @@ retrieve → decide → execute → reflect → answer
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourname/local-knowledge-workbench.git
+git clone https://github.com/cheng-xl/local-knowledge-workbench.git
 cd local-knowledge-workbench
 
 # 创建虚拟环境
