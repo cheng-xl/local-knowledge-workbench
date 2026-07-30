@@ -218,13 +218,31 @@ class RAGPipeline:
     @staticmethod
     def _rerank(query: str, docs: List[Document]) -> List[Document]:
         try:
-            from sentence_transformers import CrossEncoder
-            model = CrossEncoder("BAAI/bge-reranker-base")
-            pairs = [[query, d.page_content] for d in docs]
-            scores = model.predict(pairs)
-            scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-            logger.debug(f"Reranking: top score={scored[0][1]:.3f}")
-            return [d for d, _ in scored]
+            import requests
+            texts = [d.page_content for d in docs]
+            resp = requests.post(
+                f"{settings.siliconflow_base_url}/rerank",
+                headers={
+                    "Authorization": f"Bearer {settings.siliconflow_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.reranker_model,
+                    "query": query,
+                    "documents": texts,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = sorted(
+                data.get("results", []),
+                key=lambda x: x.get("relevance_score", 0),
+                reverse=True,
+            )
+            reranked = [docs[r["index"]] for r in results]
+            logger.debug(f"Reranking: top score={results[0].get('relevance_score', 0):.3f}")
+            return reranked
         except Exception:
             logger.warning("Reranker not available, skipping rerank")
             return docs

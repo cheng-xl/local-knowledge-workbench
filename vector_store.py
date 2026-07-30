@@ -1,36 +1,43 @@
 import os
+import time
 
+from openai import OpenAI
 from config import settings
 from loguru import logger
-from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from shared import Document
 from typing import List, Optional
 
-os.environ.setdefault("HF_ENDPOINT", settings.hf_endpoint or "https://hf-mirror.com")
-
 
 class VectorStoreManager:
     def __init__(self, persist_dir: Optional[str] = None):
         self.persist_dir = persist_dir or settings.chroma_persist_dir
-        logger.info(f"Loading embedding model: {settings.embedding_model}")
-        try:
-            self._model = SentenceTransformer(settings.embedding_model,
-                                              local_files_only=False)
-        except Exception:
-            logger.warning("Online load failed, trying offline cache only")
-            self._model = SentenceTransformer(settings.embedding_model,
-                                              local_files_only=True)
-        self._client = chromadb.PersistentClient(
+        logger.info(f"Embedding API: {settings.embedding_model} via SiliconFlow")
+        self._client = OpenAI(
+            api_key=settings.siliconflow_api_key,
+            base_url=settings.siliconflow_base_url,
+        )
+        self._chroma = chromadb.PersistentClient(
             path=self.persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        self._collection = self._client.get_or_create_collection(name="langchain")
+        self._collection = self._chroma.get_or_create_collection(name="langchain")
         logger.info(f"Chroma initialized at {self.persist_dir}")
 
     def _encode(self, texts: List[str]) -> List[List[float]]:
-        return self._model.encode(texts, normalize_embeddings=True).tolist()
+        all_embeddings = []
+        batch_size = 32
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            resp = self._client.embeddings.create(
+                model=settings.embedding_model,
+                input=batch,
+            )
+            all_embeddings.extend(d.embedding for d in resp.data)
+            if i + batch_size < len(texts):
+                time.sleep(0.2)  # rate limit guard
+        return all_embeddings
 
     def add_documents(self, documents: List[Document]) -> List[str]:
         texts = [d.page_content for d in documents]

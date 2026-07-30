@@ -1,12 +1,6 @@
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _set_hf():
-    import os
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-
 class TestCalculator:
     def test_basic(self):
         from tools.calculator import calculator

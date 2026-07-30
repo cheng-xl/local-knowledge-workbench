@@ -38,6 +38,60 @@ logger.add(
 
 st.markdown("""
 <style>
+    /* ── 锁定整体页面，禁止外层滚动 ── */
+    html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+    }
+    [data-testid="stAppViewContainer"] {
+        overflow: hidden !important;
+        height: 100vh;
+        max-height: 100vh;
+    }
+    [data-testid="stAppViewContainer"] > section {
+        overflow: hidden !important;
+    }
+    .main .block-container {
+        max-height: 100vh;
+        height: 100vh;
+        overflow: hidden !important;
+        padding: 0.4rem 1.5rem 0 1.5rem;
+        display: flex;
+        flex-direction: column;
+    }
+    .main .block-container > div:first-child {
+        flex: 1;
+        min-height: 0;
+    }
+    /* ── 隐藏 Streamlit 表单默认提示 ── */
+    [data-testid="InputInstructions"] {
+        display: none !important;
+    }
+    /* ── 标签页填满可用高度 ── */
+    .stTabs {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+    .stTabs > div:first-child {
+        flex-shrink: 0;
+    }
+    /* ── 各标签面板独立滚动 ── */
+    .stTabs [role="tabpanel"] {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto !important;
+        padding-right: 6px;
+    }
+    /* ── 侧栏紧凑 ── */
+    [data-testid="stSidebar"] .block-container {
+        padding-top: 0.5rem;
+        overflow-y: auto;
+    }
+    /* ── 思考链样式 ── */
     .main-header { font-size: 2rem; font-weight: 700; color: #1A5276; margin-bottom: 0; }
     .trace-step { padding: 0.5rem; border-left: 3px solid #2E86C1; margin: 0.3rem 0; background: #EBF5FB; border-radius: 4px; }
     .trace-step.active { border-left-color: #E74C3C; background: #FDEDEC; }
@@ -55,7 +109,7 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Lazy-load heavy modules (avoids 7s import of sentence_transformers at startup)
+# Lazy-load heavy modules
 from config import settings
 
 
@@ -71,7 +125,7 @@ def get_vector_store():
     return _get_global_vs()
 
 
-# ── 侧栏 ──────────────────────────────────────────────────
+# ── 侧栏（版本信息移至此） ──
 
 with st.sidebar:
     st.markdown('<p class="main-header"> 知识工作台</p>', unsafe_allow_html=True)
@@ -104,6 +158,8 @@ with st.sidebar:
         st.session_state.agent_trace = []
         st.session_state.thread_id = None
         st.rerun()
+    st.divider()
+    st.caption("RAG + LangGraph + MCP | MIT")
 
 # ── 标签页 ────────────────────────────────────────────────
 
@@ -213,102 +269,107 @@ with tab_qa:
     st.markdown("### 智能问答")
     st.caption("Agent 会检索相关文档，必要时调用工具来回答你的问题。对话历史自动保留。")
 
-    chat_container = st.container(height=420)
-    with chat_container:
-        for msg in st.session_state.chat_history:
-            role = "user" if msg["role"] == "user" else "assistant"
-            with st.chat_message(role):
-                st.markdown(msg["content"])
+    col_chat, col_input = st.columns([3, 1])
 
-    query = st.chat_input("输入问题，例如「总结这份文档的核心观点」或「计算 156 * 32」...")
+    # ── 左侧：对话区 ──
+    with col_chat:
+        chat_container = st.container(height=520)
+        with chat_container:
+            for msg in st.session_state.chat_history:
+                role = "user" if msg["role"] == "user" else "assistant"
+                with st.chat_message(role):
+                    st.markdown(msg["content"])
 
-    # ── Human-in-the-Loop: resume pending interrupt ──────
-    human_confirm_action = None
-    if st.session_state.get("pending_interrupt"):
-        col_approve, col_deny = st.columns(2)
-        with col_approve:
+    # ── 右侧：输入区 + 快捷提示 + 人工确认 ──
+    with col_input:
+        with st.form("qa_form", clear_on_submit=True):
+            query = st.text_area(
+                "输入问题",
+                placeholder="例如「总结这份文档」或「计算 156 * 32」",
+                height=150,
+                label_visibility="collapsed",
+            )
+            st.caption("Ctrl+Enter 提交")
+            submitted = st.form_submit_button("🚀 发送", type="primary", use_container_width=True)
+        query = query if submitted else None
+        # 快捷提问
+        with st.expander("快捷提问"):
+            for shortcut in ["总结这份文档的核心观点", "这份文档讲了什么？",
+                             "计算 156 * 32", "今天是几号？星期几？"]:
+                if st.button(shortcut, use_container_width=True, key=f"shortcut_{shortcut}"):
+                    query = shortcut
+
+        # Human-in-the-Loop
+        human_confirm_action = None
+        if st.session_state.get("pending_interrupt"):
+            st.divider()
+            st.warning("Agent 请求执行敏感操作")
             if st.button("✅ 批准操作", use_container_width=True, type="primary"):
                 human_confirm_action = True
-        with col_deny:
             if st.button("❌ 拒绝操作", use_container_width=True):
                 human_confirm_action = False
 
+    # ── 处理逻辑（spinner 在右侧，不向左侧写任何内容）──
     if query or human_confirm_action is not None:
         if query:
             st.session_state.chat_history.append({"role": "user", "content": query})
         trace = []
+        final_answer = ""
 
-        with st.chat_message("assistant"):
-            agent_status = st.status("Agent 思考中...", expanded=True)
-            try:
-                app = get_compiled_graph()
-                final_answer = ""
+        with col_input:
+            with st.spinner("思考中..."):
+                try:
+                    app = get_compiled_graph()
 
-                if st.session_state.thread_id is None:
-                    import uuid
-                    st.session_state.thread_id = str(uuid.uuid4())
-                config = {"configurable": {"thread_id": st.session_state.thread_id}}
+                    if st.session_state.thread_id is None:
+                        import uuid
+                        st.session_state.thread_id = str(uuid.uuid4())
+                    config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
-                # Resume from pending interrupt
-                if human_confirm_action is not None and st.session_state.get("pending_interrupt"):
-                    from langgraph.types import Command
-                    st.session_state.pending_interrupt = False
-                    st.session_state.pending_config = None
-                    # Resume graph with human decision
-                    for event in app.stream(
-                        Command(resume=human_confirm_action), config,
-                        stream_mode="updates",
-                    ):
-                        for node_name, output in event.items():
-                            label = step_labels.get(node_name, f" {node_name}")
-                            st.write(
-                                f"<div class='trace-step active'>{label}</div>",
-                                unsafe_allow_html=True,
-                            )
-                            trace.append({"node": node_name, "output": output})
-                            if node_name == "answer":
-                                msgs = output.get("messages", [])
-                                if msgs:
-                                    final_answer = msgs[-1].get("content", "")
-                elif query:
-                    inputs = {
-                        "messages": [{"role": "user", "content": query}],
-                        "retrieved_docs": [],
-                        "tool_calls": [],
-                        "need_human_confirm": False,
-                        "loop_count": 0,
-                        "decision": "",
-                    }
-                    for event in app.stream(inputs, config, stream_mode="updates"):
-                        for node_name, output in event.items():
-                            label = step_labels.get(node_name, f" {node_name}")
-                            st.write(
-                                f"<div class='trace-step active'>{label}</div>",
-                                unsafe_allow_html=True,
-                            )
-                            trace.append({"node": node_name, "output": output})
+                    # Resume from pending interrupt
+                    if human_confirm_action is not None and st.session_state.get("pending_interrupt"):
+                        from langgraph.types import Command
+                        st.session_state.pending_interrupt = False
+                        st.session_state.pending_config = None
+                        for event in app.stream(
+                            Command(resume=human_confirm_action), config,
+                            stream_mode="updates",
+                        ):
+                            for node_name, output in event.items():
+                                trace.append({"node": node_name, "output": output})
+                                if node_name == "answer":
+                                    msgs = output.get("messages", [])
+                                    if msgs:
+                                        final_answer = msgs[-1].get("content", "")
+                    elif query:
+                        inputs = {
+                            "messages": [{"role": "user", "content": query}],
+                            "retrieved_docs": [],
+                            "tool_calls": [],
+                            "need_human_confirm": False,
+                            "loop_count": 0,
+                            "decision": "",
+                        }
+                        for event in app.stream(inputs, config, stream_mode="updates"):
+                            for node_name, output in event.items():
+                                trace.append({"node": node_name, "output": output})
+                                if node_name == "answer":
+                                    msgs = output.get("messages", [])
+                                    if msgs:
+                                        final_answer = msgs[-1].get("content", "")
 
-                            if node_name == "answer":
-                                msgs = output.get("messages", [])
-                                if msgs:
-                                    final_answer = msgs[-1].get("content", "")
-
-                agent_status.update(label="思考完成", state="complete")
-            except Exception as e:
-                from langgraph.errors import GraphInterrupt
-                if isinstance(e, GraphInterrupt):
-                    agent_status.update(label="等待人工确认", state="running")
-                    st.session_state.pending_interrupt = True
-                    st.session_state.pending_config = config
-                    st.warning("Agent 请求执行敏感操作，请确认")
-                    st.rerun()
-                else:
-                    agent_status.update(label=f"出错了: {e}", state="error")
-                    logger.exception("Agent execution failed")
-                    final_answer = f"抱歉，处理请求时出错：{e}"
+                except Exception as e:
+                    from langgraph.errors import GraphInterrupt
+                    if isinstance(e, GraphInterrupt):
+                        st.session_state.pending_interrupt = True
+                        st.session_state.pending_config = config
+                        st.warning("Agent 请求执行敏感操作，请确认")
+                        st.rerun()
+                    else:
+                        logger.exception("Agent execution failed")
+                        final_answer = f"抱歉，处理请求时出错：{e}"
 
         if final_answer:
-            st.markdown(final_answer)
             st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
 
         st.session_state.agent_trace = trace
@@ -375,7 +436,6 @@ with tab_logs:
     else:
         st.info("暂无日志。等一下提问或上传文档就会有新的日志产生。")
 
-# ── 底部 ──────────────────────────────────────────────────
+# ── 底部 ──
 
-st.divider()
-st.caption("本地知识工作台  |  RAG + LangGraph + MCP  |  MIT License")
+

@@ -1,9 +1,3 @@
-import os
-
-# 必须在所有第三方导入之前设置，确保 huggingface_hub/transformers 使用镜像
-if not os.environ.get("HF_ENDPOINT"):
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
 from pydantic_settings import BaseSettings
 
 
@@ -13,9 +7,11 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.deepseek.com/v1"
     model_name: str = "deepseek-chat"
 
-    # Embedding
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"
-    hf_endpoint: str = "https://hf-mirror.com"
+    # SiliconFlow API (Embedding + Reranker)
+    siliconflow_api_key: str = ""
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+    embedding_model: str = "Qwen/Qwen3-VL-Embedding-8B"
+    reranker_model: str = "Qwen/Qwen3-VL-Reranker-8B"
 
     # Vector Store
     chroma_persist_dir: str = "./data/chroma"
