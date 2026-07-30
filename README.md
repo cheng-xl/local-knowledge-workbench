@@ -28,7 +28,7 @@ LangGraph Agent（6 节点状态图）
     ├── MCP Server（只读文件系统）
     └── Tools（计算器、日期时间）
     │
-Chroma 向量数据库 + BGE Embedding
+Chroma 向量数据库 + SiliconFlow API（Embedding + Reranker）
 ```
 
 **Agent 状态流转：**
@@ -74,10 +74,16 @@ cp .env.example .env
 
 `.env` 示例：
 ```bash
+# DeepSeek API
 OPENAI_API_KEY=sk-your-deepseek-key
 OPENAI_BASE_URL=https://api.deepseek.com/v1
 MODEL_NAME=deepseek-chat
-HF_ENDPOINT=https://hf-mirror.com   # 国内用户需要 HuggingFace 镜像
+
+# SiliconFlow API（Embedding + Reranker）
+SILICONFLOW_API_KEY=sk-your-siliconflow-key
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+EMBEDDING_MODEL=Qwen/Qwen3-VL-Embedding-8B
+RERANKER_MODEL=Qwen/Qwen3-VL-Reranker-8B
 ```
 
 ### 4. 启动
@@ -86,9 +92,7 @@ HF_ENDPOINT=https://hf-mirror.com   # 国内用户需要 HuggingFace 镜像
 streamlit run app.py
 ```
 
-浏览器打开 `http://localhost:8501`。
-
-首次启动会自动下载 Embedding 模型（约 400MB），请耐心等待。
+浏览器打开 `http://localhost:8501`。Embedding 和 Reranker 通过云端 API 调用，无需下载本地模型，启动 < 5 秒。
 
 ### 5. 使用
 
@@ -109,9 +113,10 @@ pytest tests/ -v
 |------|------|
 | Agent 框架 | LangGraph（6 节点状态图、条件路由、checkpoint） |
 | LLM | DeepSeek / OpenAI（兼容 OpenAI 协议的 API） |
-| Embedding | BAAI/bge-small-zh-v1.5（通过 sentence-transformers 本地运行） |
+| Embedding | Qwen/Qwen3-VL-Embedding-8B（SiliconFlow 云端 API，4096 维） |
 | 向量数据库 | Chroma（本地持久化） |
-| 检索 | BM25（rank-bm25）+ 向量检索 + RRF 融合 + Cross-encoder 重排序 |
+| 检索 | BM25（rank-bm25）+ 向量检索 + RRF 融合 + Qwen3-VL-Reranker 重排序 |
+| 重排序 | Qwen/Qwen3-VL-Reranker-8B（SiliconFlow 云端 API） |
 | MCP 协议 | 自建 MCP Server（read_file、list_dir），stdio 通信 |
 | UI | Streamlit（4 标签页中文界面） |
 | 文档处理 | pypdf、python-docx |
