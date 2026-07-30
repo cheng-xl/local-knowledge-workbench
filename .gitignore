@@ -53,16 +53,12 @@ data/chroma/*.bin
 # Streamlit
 .streamlit/
 
-# Node
-node_modules/
-package-lock.json
+# Cache
+.pytest_cache/
 
 # Temporary files
 *.tmp
 *.temp
 
-# Unrelated artifacts
+# Claude
 .claude/
-README_PYTHON.md
-create_application.js
-package.json
